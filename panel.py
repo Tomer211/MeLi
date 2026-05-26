@@ -15,6 +15,7 @@ from clientes import (
     proximo_id,
 )
 from meli import obtener_user_id, token_valido
+from kpis import capturar_kpis, guardar_kpis_inicial, leer_kpis_inicial, construir_comparacion
 
 app = Flask(__name__)
 
@@ -363,7 +364,18 @@ def nuevo_cliente():
             ],
         }
         guardar_cliente(nuevo_id, config)
-        return redirect(f"/cliente/{nuevo_id}/editar?flash=Cliente+creado.+Completá+el+perfil+del+negocio.")
+
+        # Capturar KPIs iniciales (en background para no bloquear la UI)
+        def _capturar():
+            try:
+                kpis = capturar_kpis(access_token, user_id)
+                guardar_kpis_inicial(nuevo_id, kpis)
+            except Exception as e:
+                print(f"[panel] Error capturando KPIs iniciales para {nuevo_id}: {e}")
+
+        threading.Thread(target=_capturar, daemon=True).start()
+
+        return redirect(f"/cliente/{nuevo_id}/editar?flash=Cliente+creado.+KPIs+iniciales+capturados.+Completá+el+perfil+del+negocio.")
 
     return render("Nuevo cliente", NUEVO_CONTENT)
 
@@ -618,29 +630,142 @@ def correr_ahora():
 
 # ── Reporte mensual ───────────────────────────────────────────────────────────
 
+REPORTE_CONTENT = """
+<div style="display:flex;align-items:center;gap:1rem;margin-bottom:1.5rem;flex-wrap:wrap">
+  <div class="page-title" style="margin:0">Reporte mensual — {{ nombre }}</div>
+  <span style="color:#5e6c84;font-size:.9rem">{{ mes }}</span>
+</div>
+
+{% if kpis_inicial %}
+<div class="card" style="margin-bottom:1.5rem">
+  <div class="card-title" style="margin-bottom:.3rem">KPIs: alta del cliente vs. hoy</div>
+  <div style="font-size:.82rem;color:#5e6c84;margin-bottom:1rem">
+    Fecha de alta: {{ fecha_inicial }} &nbsp;·&nbsp; Hoy: {{ fecha_hoy }}
+  </div>
+  <div style="overflow-x:auto">
+  <table>
+    <thead><tr>
+      <th>Métrica</th>
+      <th style="text-align:right">Al dar de alta</th>
+      <th style="text-align:right">Actual</th>
+      <th style="text-align:right">Delta</th>
+    </tr></thead>
+    <tbody>
+    {% for f in filas %}
+    <tr>
+      <td>{{ f.metrica }}</td>
+      <td style="text-align:right;font-variant-numeric:tabular-nums">{{ f.inicial }}</td>
+      <td style="text-align:right;font-variant-numeric:tabular-nums">{{ f.actual }}</td>
+      <td style="text-align:right">
+        {% if f.tipo == 'texto' %}
+          <span style="color:#5e6c84">{{ f.delta }}</span>
+        {% else %}
+          {% set d = f.delta %}
+          {% set mejor = f.mejor %}
+          {% set sufijo = f.sufijo %}
+          {% if d == 0 %}
+            <span style="color:#5e6c84">sin cambio</span>
+          {% elif (mejor == 'mayor' and d > 0) or (mejor == 'menor' and d < 0) %}
+            <span style="color:#006644;font-weight:700">
+              {{ '+' if d > 0 else '' }}{{ d }}{{ sufijo }} ↑
+            </span>
+          {% else %}
+            <span style="color:#bf2600;font-weight:700">
+              {{ '+' if d > 0 else '' }}{{ d }}{{ sufijo }} ↓
+            </span>
+          {% endif %}
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+{% else %}
+<div class="alert alert-info" style="margin-bottom:1.5rem">
+  Los KPIs iniciales se capturan automáticamente al dar de alta el cliente.
+  Este cliente fue creado antes de tener esa función, o la captura falló.
+</div>
+{% endif %}
+
+<div class="card">
+  <div class="card-title" style="margin-bottom:1rem">Actividad del auto-responder — mes actual</div>
+  <div>
+    <div class="stat-row">
+      <span>Total preguntas procesadas</span><span class="stat-val">{{ total }}</span>
+    </div>
+    <div class="stat-row">
+      <span>Respondidas automáticamente</span><span class="stat-val">{{ respondidas }}</span>
+    </div>
+    <div class="stat-row">
+      <span>Escaladas a atención manual</span><span class="stat-val">{{ manuales }}</span>
+    </div>
+    <div class="stat-row">
+      <span>Errores</span><span class="stat-val">{{ errores }}</span>
+    </div>
+    <div class="stat-row" style="border-top:2px solid #f4f5f7;margin-top:.4rem;padding-top:.6rem">
+      <span style="font-weight:700">Tasa de automatización</span>
+      <span class="stat-val" style="font-size:1.1rem;color:#f5a623">{{ tasa }}%</span>
+    </div>
+  </div>
+</div>
+"""
+
+
 @app.route("/reporte/<cliente_id>")
 def reporte(cliente_id):
     config = cargar_cliente(cliente_id)
     if not config:
         return redirect("/")
-    logs = leer_log(cliente_id, 500)
+
+    nombre = config.get("nombre_negocio", cliente_id)
     mes = datetime.now().strftime("%B %Y").capitalize()
+    hoy = datetime.now().strftime("%d/%m/%Y")
+    logs = leer_log(cliente_id, 500)
     total = len(logs)
     respondidas = sum(1 for l in logs if l.get("estado") == "publicada")
     manuales = sum(1 for l in logs if l.get("estado") == "manual")
     errores = sum(1 for l in logs if l.get("estado") == "error")
     tasa = round(respondidas / total * 100) if total else 0
-    nombre = config.get("nombre_negocio", cliente_id)
-    reporte_txt = f"""REPORTE MENSUAL — {nombre} — {mes}
-{'=' * 55}
-Total de preguntas procesadas  : {total}
-Respondidas automáticamente    : {respondidas}
-Escaladas a atención manual    : {manuales}
-Errores                        : {errores}
-Tasa de automatización         : {tasa}%
-{'=' * 55}
-"""
-    return f"<pre style='font-family:monospace;padding:2rem;font-size:.95rem'>{reporte_txt}</pre>"
+
+    # KPIs comparación
+    kpis_inicial = leer_kpis_inicial(cliente_id)
+    filas = []
+    kpis_actual = None
+    fecha_inicial = ""
+
+    if kpis_inicial:
+        token = config.get("meli", {}).get("access_token", "")
+        user_id = config.get("meli", {}).get("user_id", "")
+        fecha_inicial = kpis_inicial.get("fecha_captura", "")[:10]
+        try:
+            fecha_inicial = datetime.fromisoformat(
+                kpis_inicial["fecha_captura"]
+            ).strftime("%d/%m/%Y")
+        except Exception:
+            pass
+        try:
+            kpis_actual = capturar_kpis(token, user_id)
+            filas = construir_comparacion(kpis_inicial, kpis_actual)
+        except Exception as e:
+            print(f"[panel] Error obteniendo KPIs actuales para reporte: {e}")
+
+    return render(
+        f"Reporte — {nombre}",
+        REPORTE_CONTENT,
+        nombre=nombre,
+        mes=mes,
+        fecha_hoy=hoy,
+        fecha_inicial=fecha_inicial,
+        kpis_inicial=kpis_inicial,
+        filas=filas,
+        total=total,
+        respondidas=respondidas,
+        manuales=manuales,
+        errores=errores,
+        tasa=tasa,
+    )
 
 
 if __name__ == "__main__":
